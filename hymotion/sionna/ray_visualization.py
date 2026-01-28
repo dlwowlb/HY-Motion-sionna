@@ -459,7 +459,16 @@ class SionnaRayVisualizer:
             transl = torch.from_numpy(transl).float()
 
         # Get device from body model and move tensors to same device
-        device = next(body_model.parameters()).device if hasattr(body_model, 'parameters') else torch.device('cpu')
+        # Try buffers first (for models using register_buffer like WoodenMesh), then parameters
+        device = torch.device('cpu')
+        try:
+            device = next(body_model.buffers()).device
+        except StopIteration:
+            try:
+                device = next(body_model.parameters()).device
+            except StopIteration:
+                pass  # Use default CPU
+
         rot6d = rot6d.to(device)
         transl = transl.to(device)
 
