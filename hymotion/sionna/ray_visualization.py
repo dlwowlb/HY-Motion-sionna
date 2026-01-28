@@ -458,6 +458,11 @@ class SionnaRayVisualizer:
         if isinstance(transl, np.ndarray):
             transl = torch.from_numpy(transl).float()
 
+        # Get device from body model and move tensors to same device
+        device = next(body_model.parameters()).device if hasattr(body_model, 'parameters') else torch.device('cpu')
+        rot6d = rot6d.to(device)
+        transl = transl.to(device)
+
         # Forward pass through body model
         with torch.no_grad():
             output = body_model.forward({
