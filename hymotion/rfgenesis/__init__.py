@@ -55,8 +55,22 @@ from .environment import (
     list_objects,
 )
 
+# RF-Genesis Bridge (requires external/RF-Genesis)
+try:
+    from .rfgenesis_bridge import (
+        HYMotionToRFGenesisBridge,
+        RFGenesisConfig,
+        run_hymotion_rfgenesis_pipeline,
+    )
+    RFGENESIS_BRIDGE_AVAILABLE = True
+except ImportError:
+    RFGENESIS_BRIDGE_AVAILABLE = False
+    HYMotionToRFGenesisBridge = None
+    RFGenesisConfig = None
+    run_hymotion_rfgenesis_pipeline = None
+
 __all__ = [
-    # Simulator
+    # Simulator (standalone)
     "RFGenesisSimulator",
     "RFConfig",
     "DopplerConfig",
@@ -77,4 +91,9 @@ __all__ = [
     "list_presets",
     "list_materials",
     "list_objects",
+    # RF-Genesis Bridge (requires external/RF-Genesis clone)
+    "HYMotionToRFGenesisBridge",
+    "RFGenesisConfig",
+    "run_hymotion_rfgenesis_pipeline",
+    "RFGENESIS_BRIDGE_AVAILABLE",
 ]
