@@ -116,8 +116,9 @@ class RFConfig:
     # Doppler configuration
     doppler: DopplerConfig = field(default_factory=DopplerConfig)
 
-    # Environment
-    room_size: Tuple[float, float, float] = (10.0, 10.0, 3.0)  # meters
+    # Environment (can use EnvironmentConfig or manual settings)
+    environment: Optional[Any] = None  # EnvironmentConfig instance
+    room_size: Tuple[float, float, float] = (10.0, 10.0, 3.0)  # meters (fallback)
 
     # Transmitter/Receiver positions
     tx_position: List[float] = field(default_factory=lambda: [0.0, 0.0, 1.5])
@@ -137,6 +138,78 @@ class RFConfig:
     output_cir: bool = True
     output_csi: bool = True
     output_point_cloud: bool = True
+
+    @classmethod
+    def from_environment_prompt(
+        cls,
+        prompt: str,
+        frequency: float = 77e9,
+        **kwargs,
+    ) -> "RFConfig":
+        """
+        Create RFConfig from RFLoRA-style environment prompt.
+
+        Args:
+            prompt: Natural language environment description
+                    e.g., "a living room with a sofa, TV, and two windows"
+            frequency: Carrier frequency in Hz
+            **kwargs: Additional RFConfig parameters
+
+        Returns:
+            RFConfig instance with environment configured
+
+        Example:
+            >>> config = RFConfig.from_environment_prompt(
+            ...     "a kitchen with a refrigerator, table, and microwave",
+            ...     frequency=60e9
+            ... )
+        """
+        from .environment import EnvironmentConfig
+
+        env = EnvironmentConfig.from_prompt(prompt)
+
+        return cls(
+            frequency=frequency,
+            environment=env,
+            room_size=env.room_size,
+            tx_position=env.radar_position,
+            rx_position=env.radar_position,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_environment_preset(
+        cls,
+        preset_name: str,
+        frequency: float = 77e9,
+        **kwargs,
+    ) -> "RFConfig":
+        """
+        Create RFConfig from environment preset.
+
+        Available presets: living_room, office, bedroom, corridor,
+                          kitchen, bathroom, empty_room, outdoor_open
+
+        Args:
+            preset_name: Name of the preset
+            frequency: Carrier frequency in Hz
+            **kwargs: Additional RFConfig parameters
+
+        Returns:
+            RFConfig instance with preset environment
+        """
+        from .environment import EnvironmentConfig
+
+        env = EnvironmentConfig.preset(preset_name)
+
+        return cls(
+            frequency=frequency,
+            environment=env,
+            room_size=env.room_size,
+            tx_position=env.radar_position,
+            rx_position=env.radar_position,
+            **kwargs,
+        )
 
 
 class RFGenesisSimulator:

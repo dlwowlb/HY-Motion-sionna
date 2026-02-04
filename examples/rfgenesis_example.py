@@ -57,6 +57,20 @@ def parse_args():
         "--demo_mode", action="store_true",
         help="Run in demo mode with synthetic motion data"
     )
+    # Environment configuration (RFLoRA style)
+    parser.add_argument(
+        "--environment", type=str, default=None,
+        help="RFLoRA-style environment prompt (e.g., 'a living room with a sofa, TV')"
+    )
+    parser.add_argument(
+        "--env_preset", type=str, default=None,
+        choices=["living_room", "office", "bedroom", "corridor", "kitchen", "bathroom", "empty_room", "outdoor_open"],
+        help="Use a predefined environment preset"
+    )
+    parser.add_argument(
+        "--list_presets", action="store_true",
+        help="List available environment presets and exit"
+    )
     return parser.parse_args()
 
 
@@ -395,31 +409,84 @@ def visualize_point_cloud(point_cloud: dict, output_dir: str):
 def main():
     args = parse_args()
 
+    # Handle --list_presets
+    if args.list_presets:
+        from hymotion.rfgenesis import list_presets, ENVIRONMENT_PRESETS
+        print("Available Environment Presets:")
+        print("=" * 50)
+        for preset_name in list_presets():
+            desc = ENVIRONMENT_PRESETS[preset_name].get("description", "")
+            room = ENVIRONMENT_PRESETS[preset_name].get("room_size", [])
+            print(f"  {preset_name:15} - {desc}")
+            if room:
+                print(f"                   Room: {room[0]}x{room[1]}x{room[2]} m")
+        print("\nUsage: --env_preset living_room")
+        print("   or: --environment 'a bedroom with a bed, wardrobe, and mirror'")
+        return
+
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 60)
     print("RF-Genesis Integration Example for HY-Motion")
     print("=" * 60)
-    print(f"Prompt: {args.prompt}")
+    print(f"Motion Prompt: {args.prompt}")
     print(f"Duration: {args.duration}s")
     print(f"Frequency: {args.frequency / 1e9:.1f} GHz")
+    if args.environment:
+        print(f"Environment: {args.environment}")
+    elif args.env_preset:
+        print(f"Environment Preset: {args.env_preset}")
     print(f"Output: {args.output_dir}")
     print("=" * 60)
 
     # Import RF-Genesis modules
-    from hymotion.rfgenesis import RFGenesisSimulator, RFConfig, RadarConfig, DopplerConfig
+    from hymotion.rfgenesis import (
+        RFGenesisSimulator, RFConfig, RadarConfig, DopplerConfig,
+        EnvironmentConfig
+    )
+
+    # Configure environment (RFLoRA style)
+    env_config = None
+    if args.environment:
+        # Use natural language prompt for environment
+        print(f"\n[Environment] Parsing: '{args.environment}'")
+        env_config = EnvironmentConfig.from_prompt(args.environment)
+        print(f"  Room size: {env_config.room_size}")
+        print(f"  Objects: {len(env_config.objects)}")
+        for obj in env_config.objects[:5]:  # Show first 5
+            print(f"    - {obj.object_type} at {obj.position}")
+        if len(env_config.objects) > 5:
+            print(f"    ... and {len(env_config.objects) - 5} more")
+    elif args.env_preset:
+        # Use preset environment
+        print(f"\n[Environment] Loading preset: '{args.env_preset}'")
+        env_config = EnvironmentConfig.preset(args.env_preset)
+        print(f"  Room size: {env_config.room_size}")
+        print(f"  Description: {env_config.description}")
 
     # Configure RF simulation
     radar_config = RadarConfig(start_frequency=args.frequency)
     doppler_config = DopplerConfig()
 
+    # Determine TX/RX position based on environment
+    if env_config is not None:
+        tx_pos = env_config.radar_position
+        rx_pos = env_config.radar_position
+        room_size = env_config.room_size
+    else:
+        tx_pos = [0.0, -3.0, 1.5]
+        rx_pos = [0.0, -3.0, 1.5]
+        room_size = (10.0, 10.0, 3.0)
+
     rf_config = RFConfig(
         frequency=args.frequency,
         radar=radar_config,
         doppler=doppler_config,
-        tx_position=[0.0, -3.0, 1.5],  # Radar position
-        rx_position=[0.0, -3.0, 1.5],  # Same position (monostatic)
+        environment=env_config,
+        room_size=room_size,
+        tx_position=tx_pos,
+        rx_position=rx_pos,
     )
 
     # Create simulator
@@ -443,6 +510,7 @@ def main():
             "frequency": args.frequency,
             "num_frames": num_frames,
             "mode": "demo",
+            "environment": args.environment or args.env_preset or "default",
         }
     else:
         # Use HY-Motion to generate motion

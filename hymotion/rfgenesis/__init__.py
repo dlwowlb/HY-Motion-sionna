@@ -44,14 +44,37 @@ from .channel_generator import (
     CSIGenerator,
 )
 
+from .environment import (
+    EnvironmentConfig,
+    SceneObject,
+    RF_MATERIALS,
+    OBJECT_TEMPLATES,
+    ENVIRONMENT_PRESETS,
+    list_presets,
+    list_materials,
+    list_objects,
+)
+
 __all__ = [
+    # Simulator
     "RFGenesisSimulator",
     "RFConfig",
     "DopplerConfig",
     "RadarConfig",
+    # Doppler
     "DopplerExtractor",
     "extract_doppler_from_mesh_sequence",
+    # Channel
     "ChannelGenerator",
     "CIRGenerator",
     "CSIGenerator",
+    # Environment (RFLoRA style)
+    "EnvironmentConfig",
+    "SceneObject",
+    "RF_MATERIALS",
+    "OBJECT_TEMPLATES",
+    "ENVIRONMENT_PRESETS",
+    "list_presets",
+    "list_materials",
+    "list_objects",
 ]
