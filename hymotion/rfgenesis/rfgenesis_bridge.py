@@ -107,9 +107,7 @@ class HYMotionToRFGenesisBridge:
         print(f"[RFGenesisBridge] Using device: {self.device}")
 
     def _import_rfgenesis_modules(self):
-        """Import RF-Genesis modules dynamically."""
-        self._rfgenesis_native = False
-
+        """Import RF-Genesis modules - REQUIRED (no fallback)."""
         try:
             from genesis.raytracing.pathtracer import RayTracer
             from genesis.raytracing.radar import Radar
@@ -118,215 +116,38 @@ class HYMotionToRFGenesisBridge:
 
             self.RayTracer = RayTracer
             self.Radar = Radar
-            self._native_generate_signal_frames = generate_signal_frames
-            self._native_frame2pointcloud = frame2pointcloud
-            self._rfgenesis_native = True
+            self.generate_signal_frames = generate_signal_frames
+            self.frame2pointcloud = frame2pointcloud
+            self.rangeFFT = rangeFFT
+            self.dopplerFFT = dopplerFFT
 
-            print("[RFGenesisBridge] RF-Genesis native modules loaded")
+            print("[RFGenesisBridge] RF-Genesis modules loaded (Mitsuba ray tracing enabled)")
+
         except ImportError as e:
-            print(f"[Info] RF-Genesis native modules not available: {e}")
-            print("  Using standalone signal generation (no Mitsuba required)")
+            raise ImportError(
+                f"RF-Genesis modules are REQUIRED but not available: {e}\n\n"
+                "Please set up RF-Genesis:\n"
+                "  1. git clone https://github.com/Asixa/RF-Genesis external/RF-Genesis\n"
+                "  2. cd external/RF-Genesis && sh setup.sh\n"
+                "  3. pip install mitsuba==3.5.2\n\n"
+                "This will enable:\n"
+                "  - Mitsuba ray tracing for accurate PIR generation\n"
+                "  - RFLoRA environment diffusion\n"
+                "  - GPU-accelerated signal generation"
+            )
 
-        # Always use our own FFT functions for reliability
-        self.rangeFFT = self._rangeFFT
-        self.dopplerFFT = self._dopplerFFT
-        self.generate_signal_frames = self._generate_signal_frames_standalone
-        self.frame2pointcloud = self._frame2pointcloud_standalone
-
-    def _rangeFFT(self, frame: np.ndarray) -> np.ndarray:
-        """Range FFT processing."""
-        # frame shape: (num_tx, num_rx, num_chirps, num_samples)
-        num_samples = frame.shape[-1]
-        window = np.hamming(num_samples)
-        windowed = frame * window
-        return np.fft.fft(windowed, axis=-1)
-
-    def _dopplerFFT(self, range_fft: np.ndarray) -> np.ndarray:
-        """Doppler FFT processing."""
-        # range_fft shape: (num_tx, num_rx, num_chirps, num_samples)
-        num_chirps = range_fft.shape[2]
-        window = np.hamming(num_chirps).reshape(1, 1, -1, 1)
-        windowed = range_fft * window
-        doppler_fft = np.fft.fft(windowed, axis=2)
-        return np.fft.fftshift(doppler_fft, axes=2)
-
-    def _frame2pointcloud_standalone(self, frame: np.ndarray, radar_config: Dict) -> np.ndarray:
-        """Extract point cloud from radar frame."""
-        # Apply Range-Doppler processing
-        range_fft = self._rangeFFT(frame)
-        doppler_fft = self._dopplerFFT(range_fft)
-
-        # Sum over TX/RX for detection
-        power = np.abs(doppler_fft).mean(axis=(0, 1))  # (chirps, samples)
-
-        # Simple peak detection (CFAR-like)
-        threshold = np.mean(power) + 2 * np.std(power)
-        detections = np.argwhere(power > threshold)
-
-        if len(detections) == 0:
-            return np.zeros((0, 6))
-
-        # Convert to physical coordinates
-        c0 = radar_config.get("c0", 3e8)
-        fc = radar_config.get("fc", 77e9)
-        slope = radar_config.get("slope", 60.012) * 1e12
-        sample_rate = radar_config.get("sample_rate", 4400) * 1e3
-        num_chirps = radar_config.get("chirp_per_frame", 128)
-        num_samples = radar_config.get("adc_samples", 256)
-        idle_time = radar_config.get("idle_time", 7) * 1e-6
-        ramp_end_time = radar_config.get("ramp_end_time", 65) * 1e-6
-
-        # Range resolution
-        range_res = c0 * sample_rate / (2 * slope * num_samples)
-
-        # Velocity resolution
-        wavelength = c0 / fc
-        chirp_time = idle_time + ramp_end_time
-        max_vel = wavelength / (4 * chirp_time * 3)  # 3 TX
-        vel_res = 2 * max_vel / num_chirps
-
-        point_cloud = []
-        for doppler_idx, range_idx in detections[:128]:  # Limit to 128 points
-            range_val = range_idx * range_res
-            velocity = (doppler_idx - num_chirps // 2) * vel_res
-            snr = power[doppler_idx, range_idx]
-
-            # Simple angle estimation (assume forward direction)
-            x = range_val * 0.1 * np.random.randn()
-            y = range_val
-            z = 1.0 + 0.5 * np.random.randn()
-
-            point_cloud.append([x, y, z, velocity, snr, range_val])
-
-        return np.array(point_cloud) if point_cloud else np.zeros((0, 6))
-
-    def _generate_signal_frames_standalone(
-        self,
-        body_pirs: List[torch.Tensor],
-        body_auxs: List[torch.Tensor],
-        env_pir: Optional[torch.Tensor],
-        radar_config: Dict,
-    ) -> np.ndarray:
-        """
-        Standalone FMCW radar signal generation from PIR data.
-
-        This generates realistic radar frames without requiring RF-Genesis native code.
-        """
-        from tqdm import tqdm
-
-        num_tx = radar_config.get("num_tx", 3)
-        num_rx = radar_config.get("num_rx", 4)
-        num_chirps = radar_config.get("chirp_per_frame", 128)
-        num_samples = radar_config.get("adc_samples", 256)
-        fc = radar_config.get("fc", 77e9)
-        slope = radar_config.get("slope", 60.012) * 1e12  # Hz/s
-        c0 = radar_config.get("c0", 3e8)
-        frame_rate = radar_config.get("frame_per_second", 10)
-        pir_fps = 30  # PIR frame rate
-
-        wavelength = c0 / fc
-
-        # TX/RX antenna positions
-        tx_loc = np.array(radar_config.get("tx_loc", [[0, 0, 0], [4, 0, 0], [2, 1, 0]])) * wavelength / 2
-        rx_loc = np.array(radar_config.get("rx_loc", [[-6, 0, 0], [-5, 0, 0], [-4, 0, 0], [-3, 0, 0]])) * wavelength / 2
-
-        # Calculate number of radar frames
-        num_pir_frames = len(body_pirs)
-        num_radar_frames = int(num_pir_frames * frame_rate / pir_fps)
-        num_radar_frames = max(1, num_radar_frames)
-
-        # Output array
-        radar_frames = np.zeros(
-            (num_radar_frames, num_tx, num_rx, num_chirps, num_samples),
-            dtype=np.complex128
-        )
-
-        # Time parameters
-        sample_rate = radar_config.get("sample_rate", 4400) * 1e3
-        t_samples = np.arange(num_samples) / sample_rate
-
-        print(f"  Generating {num_radar_frames} radar frames...")
-
-        for radar_frame_idx in tqdm(range(num_radar_frames), desc="Generating radar frames"):
-            # Map radar frame to PIR frame
-            pir_frame_idx = int(radar_frame_idx * pir_fps / frame_rate)
-            pir_frame_idx = min(pir_frame_idx, num_pir_frames - 1)
-
-            # Get PIR data
-            pir = body_pirs[pir_frame_idx]
-            if isinstance(pir, torch.Tensor):
-                pir = pir.cpu().numpy()
-
-            # Extract point targets from PIR
-            # PIR format: (H, W, 3) where channels are (distance, intensity, velocity)
-            if pir.ndim == 3:
-                distances = pir[:, :, 0].flatten()
-                intensities = pir[:, :, 1].flatten()
-                velocities = pir[:, :, 2].flatten() if pir.shape[2] > 2 else np.zeros_like(distances)
-            else:
-                # Fallback for unexpected shape
-                distances = np.array([3.0])
-                intensities = np.array([0.7])
-                velocities = np.array([0.0])
-
-            # Filter valid points (non-zero distance and intensity)
-            valid_mask = (distances > 0.1) & (intensities > 0.1)
-            distances = distances[valid_mask]
-            intensities = intensities[valid_mask]
-            velocities = velocities[valid_mask]
-
-            if len(distances) == 0:
-                # No valid points, add a default target
-                distances = np.array([3.0])
-                intensities = np.array([0.5])
-                velocities = np.array([0.0])
-
-            # Subsample if too many points
-            max_points = 1000
-            if len(distances) > max_points:
-                indices = np.random.choice(len(distances), max_points, replace=False)
-                distances = distances[indices]
-                intensities = intensities[indices]
-                velocities = velocities[indices]
-
-            # Generate FMCW signal for each TX/RX pair
-            for tx_idx in range(num_tx):
-                for rx_idx in range(num_rx):
-                    for chirp_idx in range(num_chirps):
-                        signal = np.zeros(num_samples, dtype=np.complex128)
-
-                        for dist, intensity, vel in zip(distances, intensities, velocities):
-                            # Time of flight
-                            tof = 2 * dist / c0
-
-                            # Free space path loss
-                            fspl = (wavelength / (4 * np.pi * dist + 1e-6)) ** 2
-
-                            # Beat frequency (from FMCW)
-                            f_beat = slope * tof
-
-                            # Doppler shift
-                            f_doppler = 2 * vel / wavelength
-
-                            # Phase from antenna positions
-                            # Simplified: assume target at boresight
-                            phase_tx = 2 * np.pi * tx_loc[tx_idx, 0] / wavelength
-                            phase_rx = 2 * np.pi * rx_loc[rx_idx, 0] / wavelength
-
-                            # Total phase
-                            phase = 2 * np.pi * (f_beat + f_doppler) * t_samples + phase_tx + phase_rx
-
-                            # Add contribution
-                            amplitude = np.sqrt(fspl * intensity)
-                            signal += amplitude * np.exp(1j * phase)
-
-                        # Add noise
-                        noise_power = 1e-6
-                        signal += np.sqrt(noise_power / 2) * (np.random.randn(num_samples) + 1j * np.random.randn(num_samples))
-
-                        radar_frames[radar_frame_idx, tx_idx, rx_idx, chirp_idx, :] = signal
-
-        return radar_frames
+        # Import RFLoRA environment diffusion - REQUIRED
+        try:
+            from genesis.environment_diffusion.environemnt_diff import EnvironmentDiffusion
+            self.EnvironmentDiffusion = EnvironmentDiffusion
+            print("[RFGenesisBridge] RFLoRA environment diffusion enabled")
+        except ImportError as e:
+            raise ImportError(
+                f"RFLoRA environment diffusion is REQUIRED but not available: {e}\n\n"
+                "Please install dependencies:\n"
+                "  pip install diffusers transformers accelerate\n"
+                "  pip install peft  # For LoRA support"
+            )
 
     def _load_radar_config(self) -> Dict:
         """Load radar configuration from JSON."""
@@ -487,15 +308,21 @@ class HYMotionToRFGenesisBridge:
     def simulate_radar(
         self,
         smpl_data: Dict[str, np.ndarray],
-        environment_prompt: Optional[str] = None,
+        environment_prompt: str,
         output_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Run full RF-Genesis radar simulation pipeline.
+        Run full RF-Genesis radar simulation pipeline with Mitsuba + RFLoRA.
+
+        This is the REQUIRED pipeline that uses:
+        - Mitsuba ray tracing for accurate PIR generation
+        - RFLoRA environment diffusion for realistic scenes
+        - GPU-accelerated signal generation
 
         Args:
             smpl_data: SMPL parameters from convert_hymotion_to_smpl()
-            environment_prompt: Optional RFLoRA environment description
+            environment_prompt: RFLoRA environment description (REQUIRED)
+                               e.g., "a living room with a sofa and TV"
             output_dir: Output directory
 
         Returns:
@@ -505,27 +332,30 @@ class HYMotionToRFGenesisBridge:
                 - point_clouds: Detected point clouds
                 - range_doppler_maps: Range-Doppler maps
         """
+        if not environment_prompt:
+            raise ValueError(
+                "environment_prompt is REQUIRED for RF-Genesis simulation.\n"
+                "Please provide an environment description, e.g.:\n"
+                '  environment_prompt="a living room with a sofa, TV, and coffee table"'
+            )
+
         output_dir = output_dir or self.config.output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        print(f"[RFGenesisBridge] Running radar simulation...")
+        print(f"[RFGenesisBridge] Running full RF-Genesis pipeline...")
         print(f"  Frames: {smpl_data['num_frames']}")
-        print(f"  Environment: {environment_prompt or 'none'}")
+        print(f"  Environment: {environment_prompt}")
 
-        # Step 1: Ray tracing to generate PIR
-        print("  Step 1/3: Ray tracing...")
+        # Step 1: Mitsuba Ray tracing to generate PIR (REQUIRED)
+        print("\n  Step 1/3: Mitsuba Ray Tracing...")
         body_pirs, body_auxs = self._run_ray_tracing(smpl_data)
 
-        # Step 2: Environment diffusion (optional)
-        env_pir = None
-        if environment_prompt and self.config.use_environment:
-            print(f"  Step 2/3: Environment diffusion...")
-            env_pir = self._run_environment_diffusion(environment_prompt)
-        else:
-            print("  Step 2/3: Skipping environment diffusion")
+        # Step 2: RFLoRA Environment diffusion (REQUIRED)
+        print("\n  Step 2/3: RFLoRA Environment Diffusion...")
+        env_pir = self._run_environment_diffusion(environment_prompt)
 
         # Step 3: Signal generation
-        print("  Step 3/3: Signal generation...")
+        print("\n  Step 3/3: FMCW Signal Generation...")
         radar_frames = self.generate_signal_frames(
             body_pirs, body_auxs, env_pir, self.radar_config
         )
@@ -550,102 +380,73 @@ class HYMotionToRFGenesisBridge:
         self,
         smpl_data: Dict[str, np.ndarray],
     ) -> Tuple[List, List]:
-        """Run Mitsuba ray tracing on SMPL mesh."""
-        try:
-            # Initialize ray tracer
-            ray_tracer = self.RayTracer(self.config.rfgenesis_path)
-
-            pose = smpl_data["pose"]
-            shape = smpl_data["shape"]
-            root_translation = smpl_data["root_translation"]
-
-            # Expand shape to match frames if needed
-            if shape.shape[0] == 1:
-                shape = np.tile(shape, (pose.shape[0], 1))
-
-            body_pirs = []
-            body_auxs = []
-
-            for frame_idx in range(pose.shape[0]):
-                # Update SMPL pose
-                ray_tracer.update_pose(
-                    pose[frame_idx:frame_idx+1],
-                    shape[frame_idx:frame_idx+1],
-                    root_translation[frame_idx:frame_idx+1],
-                )
-
-                # Trace rays
-                pir, aux = ray_tracer.trace()
-                body_pirs.append(pir)
-                body_auxs.append(aux)
-
-            return body_pirs, body_auxs
-
-        except Exception as e:
-            print(f"[Warning] Ray tracing failed: {e}")
-            print("  Using fallback PIR generation")
-            return self._fallback_pir_generation(smpl_data)
-
-    def _fallback_pir_generation(
-        self,
-        smpl_data: Dict[str, np.ndarray],
-    ) -> Tuple[List, List]:
         """
-        Fallback PIR generation when Mitsuba is not available.
+        Run Mitsuba ray tracing on SMPL mesh - REQUIRED.
 
-        Creates simplified PIR from SMPL vertex positions.
+        This uses RF-Genesis's pathtracer with Mitsuba for accurate
+        PIR (Perspective Intensity Representation) generation.
         """
+        from tqdm import tqdm
+
+        # Initialize ray tracer (RF-Genesis RayTracer)
+        ray_tracer = self.RayTracer()
+
+        pose = smpl_data["pose"]
+        shape = smpl_data["shape"]
+        root_translation = smpl_data["root_translation"]
         num_frames = smpl_data["num_frames"]
-        pir_resolution = 128
+
+        # Expand shape to match frames if needed
+        if shape.shape[0] == 1:
+            shape = np.tile(shape, (num_frames, 1))
 
         body_pirs = []
         body_auxs = []
 
-        for frame_idx in range(num_frames):
-            # Create empty PIR (distance, intensity, velocity)
-            pir = np.zeros((pir_resolution, pir_resolution, 3), dtype=np.float32)
+        print(f"  Running Mitsuba ray tracing for {num_frames} frames...")
 
-            # Simple projection of root translation
-            root = smpl_data["root_translation"][frame_idx]
+        for frame_idx in tqdm(range(num_frames), desc="Ray tracing"):
+            # Update SMPL pose in the scene
+            ray_tracer.update_pose(
+                pose[frame_idx:frame_idx+1],
+                shape[frame_idx:frame_idx+1],
+                root_translation[frame_idx:frame_idx+1],
+            )
 
-            # Distance from camera (assume camera at z=5)
-            distance = np.linalg.norm(root - np.array([0, 0, 5]))
-
-            # Fill central region with body
-            center = pir_resolution // 2
-            radius = 20
-            for i in range(-radius, radius + 1):
-                for j in range(-radius, radius + 1):
-                    if i*i + j*j < radius*radius:
-                        pir[center + i, center + j, 0] = distance + np.random.randn() * 0.1
-                        pir[center + i, center + j, 1] = 0.7  # Intensity
-                        if frame_idx > 0:
-                            prev_root = smpl_data["root_translation"][frame_idx - 1]
-                            pir[center + i, center + j, 2] = np.linalg.norm(root - prev_root) * 30
-
-            body_pirs.append(torch.from_numpy(pir).to(self.device))
-            body_auxs.append(torch.zeros((pir_resolution, pir_resolution, 3), device=self.device))
+            # Trace rays and get PIR
+            pir, aux = ray_tracer.trace()
+            body_pirs.append(pir)
+            body_auxs.append(aux)
 
         return body_pirs, body_auxs
 
     def _run_environment_diffusion(
         self,
         prompt: str,
-    ) -> Optional[Any]:
-        """Run RFLoRA environment diffusion."""
-        try:
-            from genesis.environment_diffusion.environemnt_diff import EnvironmentDiffusion
+    ) -> torch.Tensor:
+        """
+        Run RFLoRA environment diffusion - REQUIRED.
 
-            env_diff = EnvironmentDiffusion()
-            env_image = env_diff.generate(prompt)
+        Uses Stable Diffusion with RFLoRA fine-tuned weights to generate
+        realistic indoor environment images for radar simulation.
 
-            # Convert to PIR format
-            env_pir = self._image_to_pir(env_image)
-            return env_pir
+        Args:
+            prompt: Environment description (e.g., "a living room with furniture")
 
-        except Exception as e:
-            print(f"[Warning] Environment diffusion failed: {e}")
-            return None
+        Returns:
+            Environment PIR tensor
+        """
+        print(f"  Generating environment with RFLoRA: '{prompt}'")
+
+        # Use pre-loaded EnvironmentDiffusion class
+        env_diff = self.EnvironmentDiffusion()
+        env_image = env_diff.generate(prompt)
+
+        # Convert to PIR format
+        env_pir = self._image_to_pir(env_image)
+
+        print(f"  Environment PIR generated: {env_pir.shape}")
+        return env_pir
 
     def _image_to_pir(self, image) -> torch.Tensor:
         """Convert environment image to PIR tensor."""
@@ -750,7 +551,7 @@ class HYMotionToRFGenesisBridge:
 def run_hymotion_rfgenesis_pipeline(
     runtime: Any,  # T2MRuntime
     motion_prompt: str,
-    environment_prompt: Optional[str] = None,
+    environment_prompt: str,
     duration: float = 3.0,
     output_dir: str = "output/hymotion_rfgenesis",
     seed: int = 42,
@@ -758,24 +559,40 @@ def run_hymotion_rfgenesis_pipeline(
     """
     Complete pipeline: HY-Motion → RF-Genesis → Doppler FFT.
 
+    This pipeline REQUIRES:
+    - Mitsuba ray tracing for accurate PIR generation
+    - RFLoRA environment diffusion for realistic scenes
+
     Args:
         runtime: HY-Motion T2MRuntime instance
         motion_prompt: Text description of human motion
-        environment_prompt: RFLoRA environment description (optional)
+        environment_prompt: RFLoRA environment description (REQUIRED)
+                           e.g., "a living room with a sofa and TV"
         duration: Motion duration in seconds
         output_dir: Output directory
         seed: Random seed
 
     Returns:
         Dictionary with all simulation results
+
+    Raises:
+        ValueError: If environment_prompt is empty
+        ImportError: If RF-Genesis modules are not available
     """
+    if not environment_prompt:
+        raise ValueError(
+            "environment_prompt is REQUIRED for RF-Genesis simulation.\n"
+            "Please provide an environment description, e.g.:\n"
+            '  environment_prompt="a living room with a sofa, TV, and coffee table"'
+        )
+
     os.makedirs(output_dir, exist_ok=True)
 
     print("=" * 60)
     print("HY-Motion + RF-Genesis Pipeline")
     print("=" * 60)
     print(f"Motion: {motion_prompt}")
-    print(f"Environment: {environment_prompt or 'none'}")
+    print(f"Environment: {environment_prompt}")
     print(f"Duration: {duration}s")
     print("=" * 60)
 

@@ -4,29 +4,36 @@ HY-Motion + RF-Genesis Integrated Pipeline Example
 
 This example demonstrates the complete pipeline:
 1. HY-Motion: Generate 3D human motion from text prompt
-2. RF-Genesis: Simulate mmWave radar signals with RFLoRA environments
+2. RF-Genesis: Simulate mmWave radar signals with RFLoRA environments (REQUIRED)
 3. Doppler FFT: Extract Doppler spectrum and point clouds
+
+IMPORTANT: This pipeline REQUIRES:
+    - Mitsuba ray tracing for accurate PIR generation
+    - RFLoRA environment diffusion for realistic scenes
+    - environment_prompt is REQUIRED (use --environment or --env_preset)
 
 Requirements:
     - HY-Motion model weights
     - RF-Genesis (git clone https://github.com/Asixa/RF-Genesis external/RF-Genesis)
     - RF-Genesis setup (cd external/RF-Genesis && sh setup.sh)
+    - pip install mitsuba==3.5.2 diffusers transformers accelerate peft
     - GPU with CUDA support
 
 Usage:
-    # Full pipeline with environment
+    # Full pipeline with custom environment
     python examples/hymotion_rfgenesis_pipeline.py \
         --motion "A person walking forward" \
         --environment "a living room with a sofa, TV, and coffee table"
 
-    # Without environment (faster)
+    # Using environment preset
     python examples/hymotion_rfgenesis_pipeline.py \
         --motion "A person waving hands" \
-        --no-environment
+        --env_preset living_room
 
     # Demo mode (synthetic motion, no HY-Motion model needed)
     python examples/hymotion_rfgenesis_pipeline.py \
         --motion "A person walking" \
+        --env_preset office \
         --demo_mode
 """
 
@@ -46,11 +53,14 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # With RFLoRA environment
+  # With RFLoRA environment prompt
   python %(prog)s --motion "A person walking" --environment "a living room"
 
-  # Demo mode (no HY-Motion model needed)
-  python %(prog)s --motion "walking" --demo_mode
+  # With environment preset
+  python %(prog)s --motion "A person walking" --env_preset living_room
+
+  # Demo mode (synthetic motion, environment still required)
+  python %(prog)s --motion "walking" --env_preset office --demo_mode
 
   # List available environment presets
   python %(prog)s --list_env_presets
@@ -67,19 +77,15 @@ Examples:
         help="Motion duration in seconds"
     )
 
-    # Environment settings (RFLoRA)
+    # Environment settings (RFLoRA) - REQUIRED
     parser.add_argument(
         "--environment", "-e", type=str, default=None,
-        help="RFLoRA environment prompt (e.g., 'a living room with furniture')"
+        help="RFLoRA environment prompt (REQUIRED, e.g., 'a living room with furniture')"
     )
     parser.add_argument(
         "--env_preset", type=str, default=None,
         choices=["living_room", "office", "bedroom", "corridor", "kitchen"],
-        help="Use predefined environment preset"
-    )
-    parser.add_argument(
-        "--no-environment", action="store_true",
-        help="Skip environment generation (faster)"
+        help="Use predefined environment preset (alternative to --environment)"
     )
     parser.add_argument(
         "--list_env_presets", action="store_true",
@@ -270,14 +276,22 @@ def main():
         print("   or: --environment 'your custom environment description'")
         return
 
-    # Determine environment prompt
+    # Determine environment prompt (REQUIRED)
     env_prompt = None
-    if not args.no_environment:
-        if args.env_preset:
-            env_prompt = ENV_PRESETS.get(args.env_preset)
-            print(f"Using environment preset: {args.env_preset}")
-        elif args.environment:
-            env_prompt = args.environment
+    if args.env_preset:
+        env_prompt = ENV_PRESETS.get(args.env_preset)
+        print(f"Using environment preset: {args.env_preset}")
+    elif args.environment:
+        env_prompt = args.environment
+
+    # Environment is REQUIRED
+    if not env_prompt:
+        print("ERROR: Environment is REQUIRED for RF-Genesis simulation.")
+        print("\nPlease specify one of:")
+        print("  --environment 'a living room with furniture'")
+        print("  --env_preset living_room")
+        print("\nRun with --list_env_presets to see available presets.")
+        return
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -287,7 +301,7 @@ def main():
     print("=" * 70)
     print(f"Motion Prompt:      {args.motion}")
     print(f"Duration:           {args.duration}s")
-    print(f"Environment:        {env_prompt or '(none - faster)'}")
+    print(f"Environment:        {env_prompt}")
     print(f"Output Directory:   {args.output_dir}")
     print(f"Mode:               {'Demo' if args.demo_mode else 'Full'}")
     print("=" * 70)
@@ -298,10 +312,10 @@ def main():
         RFGenesisConfig,
     )
 
-    # Initialize bridge
+    # Initialize bridge (environment is always enabled)
     config = RFGenesisConfig(
-        use_environment=not args.no_environment,
-        environment_prompt=env_prompt or "",
+        use_environment=True,
+        environment_prompt=env_prompt,
         output_dir=args.output_dir,
     )
 
