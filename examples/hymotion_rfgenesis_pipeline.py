@@ -343,6 +343,7 @@ def main():
                     text=args.motion,
                     seeds_csv=str(args.seed),
                     duration=args.duration,
+                    cfg_scale=5.0,
                     output_format="dict",
                 )
 
